@@ -1,0 +1,313 @@
+service: recontagem-tse
+
+frameworkVersion: '3'
+
+custom:
+  s3BucketName: ${self:service}-eleicoes2022-${aws:accountId}-${sls:stage}
+
+provider:
+  name: aws
+  runtime: python3.9
+  architecture: arm64
+  memorySize: 256
+  timeout: 60
+
+package:
+  individually: true
+  patterns:
+    - '!**'
+
+functions:
+  metadata:
+    handler: metadata.lambda_handler
+    role: MetadataRole
+    name: ${self:service}-metadata-${sls:stage}
+    package:
+      patterns: 'metadata.py'
+    environment:
+      PROCESSAMENTO_RDVS: !Ref ProcessamentoRDVsTable
+    events:
+     - s3:
+        bucket: ${self:custom.s3BucketName}
+        event: s3:ObjectCreated:*
+        rules:
+          - suffix: .rdv
+
+  stream_to_sqs:
+    handler: stream_to_sqs.lambda_handler
+    role: StreamToSQSRole
+    name: ${self:service}-streamToSqs-${sls:stage}
+    package:
+      patterns:
+        - 'stream_to_sqs.py'
+        - 'libs/json_util.py'
+    environment:
+      SQS_URL: !Ref recontagemQueue
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt ProcessamentoRDVsTable.StreamArn
+          batchSize: 10
+          maximumRetryAttempts: 5
+          filterPatterns:
+            - eventName: [INSERT]
+
+  processar_rdvs:
+    name: ${self:service}-processarRDVs-${sls:stage}
+    handler: processamento.lambda_handler
+    role: ProcessarRDVsRole
+    package:
+      patterns:
+        - 'libs/**'
+        - '!libs/json_util.py'
+        - 'processamento.py'
+    environment:
+      ASN1_PATH: 'libs/rdv.asn1'
+      PROCESSAMENTO_TABLE: !Ref ProcessamentoRDVsTable
+      RESULTADOS_TABELA: !Ref resultadoMunicipios
+      LIBS_PATH: libs
+    events:
+      - sqs:
+          arn: !GetAtt recontagemQueue.Arn
+          batchSize: 100
+          maximumBatchingWindow: 10
+
+  aggregator:
+    handler: aggregator.lambda_handler
+    name: ${self:service}-aggregator-${sls:stage}
+    role: aggregatorRole
+    package:
+      patterns:
+        - 'aggregator.py'
+        - 'libs/json_util.py'
+    environment:
+      TABELA_ESTADO: !Ref resultadoEstados
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt resultadoMunicipios.StreamArn
+          batchSize: 100
+          maximumRetryAttempts: 5
+          filterPatterns:
+            - eventName: [INSERT]
+
+
+resources:
+  Resources:
+    ProcessamentoRDVsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: "estado"
+            AttributeType: "S"
+          - AttributeName: "file_name"
+            AttributeType: "S"
+          - AttributeName: "municipio"
+            AttributeType: "N"
+          - AttributeName: "zona"
+            AttributeType: "S"
+        BillingMode: PAY_PER_REQUEST
+        KeySchema:
+          - AttributeName: estado
+            KeyType: HASH
+          - AttributeName: file_name
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: municipio-zona-index
+            KeySchema:
+              - AttributeName: municipio
+                KeyType: HASH
+              - AttributeName: zona
+                KeyType: RANGE
+            Projection:
+                ProjectionType: ALL
+        LocalSecondaryIndexes:
+          - IndexName: municipio-index
+            KeySchema:
+              - AttributeName: estado
+                KeyType: HASH
+              - AttributeName: municipio
+                KeyType: RANGE
+            Projection:
+                ProjectionType: ALL
+        StreamSpecification:
+          StreamViewType: NEW_IMAGE
+        TableName: !Sub ${self:service}-processamentoRDVs-${sls:stage}
+
+    resultadoMunicipios:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: "municipio"
+            AttributeType: "N"
+          - AttributeName: "ZONA#SECAO"
+            AttributeType: "S"
+        BillingMode: PAY_PER_REQUEST
+        KeySchema:
+          - AttributeName: municipio
+            KeyType: HASH
+          - AttributeName: "ZONA#SECAO"
+            KeyType: RANGE
+        StreamSpecification:
+          StreamViewType: NEW_IMAGE
+        TableName: !Sub ${self:service}-resultadoMunicipio-${sls:stage}
+    
+    resultadoEstados:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: "estado"
+            AttributeType: "S"
+        BillingMode: PAY_PER_REQUEST
+        KeySchema:
+          - AttributeName: estado
+            KeyType: HASH
+        TableName: !Sub ${self:service}-resultadoEstados-${sls:stage}
+
+    recontagemQueue: 
+      Type: AWS::SQS::Queue
+      Properties: 
+        QueueName: ${self:service}-queue-${sls:stage}
+        VisibilityTimeout: 60
+
+    MetadataRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: dynamo-permissions
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:PutItem
+                  Resource: !GetAtt ProcessamentoRDVsTable.Arn
+
+    StreamToSQSRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: dynamo-permissions
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:GetShardIterator
+                    - dynamodb:DescribeStream
+                    - dynamodb:GetRecords
+                  Resource: !GetAtt ProcessamentoRDVsTable.StreamArn
+                - Effect: Allow
+                  Action:
+                    - dynamodb:ListStreams
+                  Resource: "*"
+          - PolicyName: sqs-permissions
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - sqs:SendMessage
+                  Resource: !GetAtt recontagemQueue.Arn
+
+    ProcessarRDVsRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: dynamo-permissions
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:BatchWriteItem
+                    - dynamodb:PutItem
+                    - dynamodb:UpdateItem
+                  Resource: 
+                    - !GetAtt ProcessamentoRDVsTable.Arn
+                    - !GetAtt resultadoMunicipios.Arn
+                - Effect: Allow
+                  Action:
+                    - dynamodb:ListStreams
+                  Resource: "*"
+          - PolicyName: sqs-permissions
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - sqs:DeleteMessage
+                    - sqs:ReceiveMessage
+                    - sqs:GetQueueAttributes
+                  Resource: !GetAtt recontagemQueue.Arn
+          - PolicyName: s3-permissions
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: arn:aws:s3:::${self:custom.s3BucketName}/*
+
+    aggregatorRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: dynamo-permissions
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:GetShardIterator
+                    - dynamodb:DescribeStream
+                    - dynamodb:GetRecords
+                  Resource: !GetAtt resultadoMunicipios.StreamArn
+                - Effect: Allow
+                  Action:
+                    - dynamodb:ListStreams
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - dynamodb:GetItem
+                    - dynamodb:UpdateItem
+                  Resource: !GetAtt resultadoEstados.Arn
